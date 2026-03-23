@@ -280,12 +280,26 @@ app.get('/health', (_, res) => res.json({ status: 'ok', sessions: sessions.size 
 /* ── Serve the frontend HTML from root folder ── */
 app.use(express.static(__dirname));
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'MicroMind_v22.html'));
+  const htmlPath = path.join(__dirname, 'MicroMind_v22.html');
+  const fs = require('fs');
+  if (fs.existsSync(htmlPath)) {
+    res.sendFile(htmlPath);
+  } else {
+    res.send(`
+      <html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#F5F3FF">
+        <h1 style="color:#7C3AED">🧠 MicroMind Server is Running! ✅</h1>
+        <p style="color:#666;font-size:18px">But <b>MicroMind_v22.html</b> is missing from your repo.</p>
+        <p style="color:#666">Please upload <b>MicroMind_v22.html</b> to your GitHub repo root folder.</p>
+        <p style="margin-top:30px;color:#059669;font-size:16px">✅ Gemini AI Studio: ${process.env.GEMINI_API_KEY ? 'Key Loaded' : 'Key Missing'}</p>
+        <p style="color:#059669">✅ API endpoints /api/ai and /api/quota are working!</p>
+      </body></html>
+    `);
+  }
 });
 
 /* ── START ── */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 MicroMind server running on port ${PORT}`);
   console.log(`📡 Gemini AI Studio: ${process.env.GEMINI_API_KEY ? '✅ Key loaded' : '❌ GEMINI_API_KEY not set!'}`);
   console.log(`📊 Quotas: Chat=${QUOTAS.chat} Lesson=${QUOTAS.lesson} Visual=${QUOTAS.visual} Coding=${QUOTAS.coding}`);
