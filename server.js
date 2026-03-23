@@ -1,307 +1,261 @@
 /* ════════════════════════════════════════════════════════════════
-   🧠 MicroMind Server — Gemini AI Studio (Primary) + Pollinations (Fallback)
-   
-   QUOTA PER SESSION (resets every 24h):
-     Chat    → 10 uses  → AI Studio (Gemini 2.0 Flash)
-     Lesson  → 5 uses   → AI Studio
-     Visual  → 10 uses  → AI Studio
-     Coding  → 15 uses  → AI Studio
-     Over quota → auto fallback to Pollinations AI (free, no key)
+   🧠 MicroMind Server v2 — FIXED: Rate Limit + Parallel AI
+   ─────────────────────────────────────────────────────────────────
+   BUG FIXES:
+   ✅ Fix 1: Dual Gemini models (2.0-flash + 1.5-flash) = 2x quota
+   ✅ Fix 2: Rate limiter — max 12 calls/min per Gemini model
+   ✅ Fix 3: Pollinations runs PARALLEL (Promise.any) not sequential
+   ✅ Fix 4: If Gemini 429 → auto-switch to other Gemini model
+   ✅ Fix 5: Server ALWAYS returns something — never leaves user hanging
    ════════════════════════════════════════════════════════════════ */
 
 const express = require('express');
 const cors    = require('cors');
 const path    = require('path');
 const crypto  = require('crypto');
+const fs      = require('fs');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '3mb' }));
 
-/* ── QUOTA CONFIG — change these numbers anytime ── */
-const QUOTAS = {
-  chat:   10,   // 10 AI Studio calls for chat
-  lesson:  5,   // 5  AI Studio calls for lesson generation
-  visual: 10,   // 10 AI Studio calls for visual notes
-  coding: 15,   // 15 AI Studio calls for coding lessons
-};
+/* ── QUOTA CONFIG ── */
+const QUOTAS = { chat: 15, lesson: 8, visual: 15, coding: 20 };
 
-/* ── IN-MEMORY SESSION STORE ──
-   Each user gets a session ID (UUID) stored in their browser (localStorage).
-   Resets after 24 hours. For production you can swap this with Redis. */
+/* ── SESSION STORE ── */
 const sessions = new Map();
-
 function getOrCreateSession(sid) {
-  // If no sid given or unknown, create fresh
   if (!sid || !sessions.has(sid)) {
     const newId = crypto.randomUUID();
-    sessions.set(newId, {
-      id:        newId,
-      createdAt: Date.now(),
-      usage:     { chat: 0, lesson: 0, visual: 0, coding: 0 }
-    });
+    sessions.set(newId, { id: newId, createdAt: Date.now(), usage: { chat:0, lesson:0, visual:0, coding:0 } });
     return sessions.get(newId);
   }
   return sessions.get(sid);
 }
-
-// Auto-clean sessions older than 24 hours (runs every 30 min)
 setInterval(() => {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  for (const [key, session] of sessions) {
-    if (session.createdAt < cutoff) sessions.delete(key);
-  }
-}, 30 * 60 * 1000);
+  const cutoff = Date.now() - 86400000;
+  for (const [k, s] of sessions) if (s.createdAt < cutoff) sessions.delete(k);
+}, 1800000);
 
 /* ════════════════════════════════════════════════════════════════
-   🤖  GEMINI AI STUDIO CALLER
-   Uses gemini-2.0-flash — best free model on AI Studio
-   Get your free API key: https://aistudio.google.com/apikey
+   ⏱️  RATE LIMITER — prevents Gemini 429 errors
+   Free Gemini = 15 RPM per model. We cap at 12 to be safe.
 ════════════════════════════════════════════════════════════════ */
-async function callGemini(messages, system, maxTokens = 1800) {
-  const GEMINI_KEY = process.env.GEMINI_API_KEY;
-  if (!GEMINI_KEY) throw new Error('GEMINI_API_KEY not set in environment');
+const RL = {
+  calls: {},
+  MAX: 12,
+  canCall(m) {
+    const now = Date.now();
+    if (!this.calls[m]) this.calls[m] = [];
+    this.calls[m] = this.calls[m].filter(t => now - t < 60000);
+    return this.calls[m].length < this.MAX;
+  },
+  record(m) { if (!this.calls[m]) this.calls[m] = []; this.calls[m].push(Date.now()); },
+  usage(m)  { const now=Date.now(); return (this.calls[m]||[]).filter(t=>now-t<60000).length; }
+};
 
-  // Convert OpenAI-style messages → Gemini format
-  const contents = messages.map(m => ({
-    role:  m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: String(m.content).trim() }]
-  }));
+/* ════════════════════════════════════════════════════════════════
+   🤖  GEMINI — 2 models = 30 RPM total free quota
+   gemini-2.0-flash: 15 RPM (separate pool)
+   gemini-1.5-flash: 15 RPM (separate pool)
+   If one 429s → instantly switch to other!
+════════════════════════════════════════════════════════════════ */
+async function callGeminiModel(model, messages, system, maxTokens) {
+  const KEY = process.env.GEMINI_API_KEY;
+  if (!KEY) throw new Error('NO_KEY');
+  if (!RL.canCall(model)) throw new Error(`RATE_LIMIT:${model}:${RL.usage(model)}/min`);
 
-  // Gemini requires alternating user/model roles — merge consecutive same-role
-  const merged = [];
-  for (const msg of contents) {
-    if (merged.length && merged[merged.length - 1].role === msg.role) {
-      merged[merged.length - 1].parts[0].text += '\n' + msg.parts[0].text;
-    } else {
-      merged.push({ ...msg, parts: [{ text: msg.parts[0].text }] });
-    }
+  const contents = [];
+  for (const m of messages) {
+    const role = m.role === 'assistant' ? 'model' : 'user';
+    const text = String(m.content || '').trim();
+    if (!text) continue;
+    if (contents.length && contents[contents.length-1].role === role)
+      contents[contents.length-1].parts[0].text += '\n' + text;
+    else contents.push({ role, parts: [{ text }] });
   }
-  // Must start with user
-  if (!merged.length || merged[0].role !== 'user') {
-    merged.unshift({ role: 'user', parts: [{ text: 'Hello' }] });
-  }
+  if (!contents.length || contents[0].role !== 'user')
+    contents.unshift({ role:'user', parts:[{ text:'Hello' }] });
 
-  const requestBody = {
-    contents: merged,
-    generationConfig: {
-      maxOutputTokens: Math.min(maxTokens, 2048),
-      temperature: 0.82,
-      topP: 0.95,
-    }
+  const body = {
+    contents,
+    generationConfig: { maxOutputTokens: Math.min(maxTokens, 900), temperature: 0.8, topP: 0.95 }
   };
+  if (system && system.trim())
+    body.systemInstruction = { parts: [{ text: system.trim().slice(0, 800) }] };
 
-  // Add system instruction if provided
-  if (system && system.trim()) {
-    requestBody.systemInstruction = { parts: [{ text: system.trim() }] };
-  }
+  RL.record(model);
 
   const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
-    {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(requestBody),
-      signal:  AbortSignal.timeout(22000)   // 22s timeout
-    }
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${KEY}`,
+    { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body), signal:AbortSignal.timeout(18000) }
   );
 
   if (!res.ok) {
-    const errBody = await res.text().catch(() => '');
-    throw new Error(`Gemini HTTP ${res.status}: ${errBody.slice(0, 120)}`);
+    const err = await res.text().catch(()=>'');
+    throw new Error(`Gemini_${res.status}: ${err.slice(0,100)}`);
   }
-
   const data = await res.json();
-
-  // Check for safety blocks
-  if (data.candidates?.[0]?.finishReason === 'SAFETY') {
-    throw new Error('Gemini safety block');
-  }
-
+  if (data.candidates?.[0]?.finishReason === 'SAFETY') throw new Error('SAFETY');
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text || text.length < 4) throw new Error('Gemini returned empty response');
-
+  if (!text || text.length < 4) throw new Error('EMPTY');
   return text.trim();
 }
 
-/* ════════════════════════════════════════════════════════════════
-   🌟  POLLINATIONS FALLBACK (server-side, used if Gemini fails)
-   Only used when: (a) quota exceeded, or (b) Gemini errors out
-════════════════════════════════════════════════════════════════ */
-async function callPollinations(messages, system, maxTokens = 1800) {
-  const models = ['openai-large', 'openai', 'mistral', 'llama'];
-
-  for (const model of models) {
+async function callGemini(messages, system, maxTokens) {
+  for (const model of ['gemini-2.0-flash', 'gemini-1.5-flash']) {
     try {
-      const body = {
-        model,
-        messages: system
-          ? [{ role: 'system', content: system }, ...messages]
-          : messages,
-        max_tokens: Math.min(maxTokens, 2048),
-        seed: Math.floor(Math.random() * 9999)
-      };
-
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 14000);
-
-      const res = await fetch('https://text.pollinations.ai/openai', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(body),
-        signal:  controller.signal
-      });
-      clearTimeout(timer);
-
-      if (!res.ok) continue;
-      const data = await res.json();
-      const text = data.choices?.[0]?.message?.content;
-      if (text && text.length > 4) return text.trim();
-    } catch (_) { /* try next model */ }
+      const text = await callGeminiModel(model, messages, system, maxTokens);
+      console.log(`[Gemini ✅] ${model} rpm=${RL.usage(model)}`);
+      return text;
+    } catch (e) {
+      const msg = String(e.message);
+      if (msg.includes('429') || msg.includes('RATE_LIMIT')) {
+        console.warn(`[Gemini ⚠️] ${model} rate limited → trying next model`);
+      } else {
+        console.warn(`[Gemini ⚠️] ${model}: ${msg.slice(0,60)}`);
+      }
+    }
   }
-
-  throw new Error('All Pollinations models failed');
+  throw new Error('All Gemini models failed');
 }
 
 /* ════════════════════════════════════════════════════════════════
-   📡  POST /api/ai  — Main endpoint called by the frontend
-   
-   Request body:
-     messages  — array of {role, content}
-     system    — system prompt string (optional)
-     max       — max tokens (optional, default 1600)
-     type      — "chat" | "lesson" | "visual" | "coding" (for quota tracking)
-   
-   Response:
-     text      — the AI response
-     ai        — which AI was used: "gemini" | "pollinations"
-     sessionId — session UUID (save this in localStorage)
-     remaining — { chat, lesson, visual, coding } — how many AI Studio calls left
+   🌟  POLLINATIONS — ALL models race in PARALLEL
+   Promise.any = first valid response wins, no sequential waiting!
+════════════════════════════════════════════════════════════════ */
+async function pollModel(model, messages, system, maxTokens, ms=13000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await fetch('https://text.pollinations.ai/openai', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        model,
+        messages: system ? [{role:'system',content:system.slice(0,500)}, ...messages] : messages,
+        max_tokens: Math.min(maxTokens, 700),
+        seed: Math.floor(Math.random()*9999)
+      }),
+      signal: controller.signal
+    });
+    clearTimeout(timer);
+    if (!res.ok) throw new Error(`${model}-${res.status}`);
+    const d = await res.json();
+    const t = d.choices?.[0]?.message?.content;
+    if (!t || t.length < 5) throw new Error('empty');
+    return t.trim();
+  } catch(e) { clearTimeout(timer); throw e; }
+}
+
+async function callPollinations(messages, system, maxTokens) {
+  // Round 1: 4 models in parallel
+  try {
+    const result = await Promise.any([
+      pollModel('openai-large', messages, system, maxTokens),
+      pollModel('mistral',      messages, system, maxTokens),
+      pollModel('openai',       messages, system, maxTokens),
+      pollModel('llama',        messages, system, maxTokens),
+    ]);
+    console.log(`[Pollinations ✅] parallel`);
+    return result;
+  } catch(e) {}
+
+  // Round 2: backup models
+  try {
+    const result = await Promise.any([
+      pollModel('qwen-coder', messages, system, maxTokens),
+      pollModel('phi',        messages, system, maxTokens),
+    ]);
+    return result;
+  } catch(e) {
+    throw new Error('All Pollinations failed');
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   📡  POST /api/ai
 ════════════════════════════════════════════════════════════════ */
 app.post('/api/ai', async (req, res) => {
   try {
-    const {
-      messages = [],
-      system   = '',
-      max      = 1600,
-      type     = 'chat'   // which quota bucket to use
-    } = req.body;
+    const { messages=[], system='', max=1200, type='chat' } = req.body;
+    if (!messages.length) return res.status(400).json({ error:'No messages' });
 
-    if (!messages.length) {
-      return res.status(400).json({ error: 'No messages provided' });
-    }
-
-    // ── SESSION ──
-    const incomingSid = req.headers['x-session-id'] || '';
-    const session = getOrCreateSession(incomingSid);
+    const session = getOrCreateSession(req.headers['x-session-id']||'');
     res.setHeader('x-session-id', session.id);
 
-    // ── QUOTA CHECK ──
-    const bucketKey  = QUOTAS[type] !== undefined ? type : 'chat';
-    const quotaLimit = QUOTAS[bucketKey];
-    const usedSoFar  = session.usage[bucketKey] || 0;
-    const withinQuota = usedSoFar < quotaLimit;
+    const key   = QUOTAS[type]!==undefined ? type : 'chat';
+    const limit = QUOTAS[key];
+    const used  = session.usage[key]||0;
 
-    let responseText = null;
-    let aiUsed       = 'pollinations';
+    let text = null, ai = 'pollinations';
 
-    // ── TRY GEMINI (AI STUDIO) FIRST ──
-    if (withinQuota) {
+    if (used < limit) {
       try {
-        responseText = await callGemini(messages, system, max);
-        session.usage[bucketKey] = usedSoFar + 1;
-        aiUsed = 'gemini';
-        console.log(`[Gemini ✅] type=${type} used=${session.usage[bucketKey]}/${quotaLimit} sid=${session.id.slice(0,8)}`);
-      } catch (geminiErr) {
-        console.warn(`[Gemini ⚠️] Failed (${geminiErr.message}), falling to Pollinations`);
+        text = await callGemini(messages, system, max);
+        session.usage[key] = used + 1;
+        ai = 'gemini';
+      } catch(e) {
+        console.warn(`[Gemini ❌] ${String(e.message).slice(0,80)} → Pollinations`);
       }
     } else {
-      console.log(`[Quota 🔒] type=${type} limit reached (${quotaLimit}), using Pollinations. sid=${session.id.slice(0,8)}`);
+      console.log(`[Quota 🔒] ${type} ${limit} reached → Pollinations`);
     }
 
-    // ── FALLBACK TO POLLINATIONS ──
-    if (!responseText) {
+    if (!text) {
       try {
-        responseText = await callPollinations(messages, system, max);
-        aiUsed = 'pollinations';
-        console.log(`[Pollinations ✅] sid=${session.id.slice(0,8)}`);
-      } catch (pollinationsErr) {
-        console.error(`[Pollinations ❌] ${pollinationsErr.message}`);
-        // Last resort — tell frontend to use its own built-in endpoints
-        return res.json({
-          text:      null,
-          ai:        'client-fallback',
-          sessionId: session.id,
-          remaining: buildRemaining(session)
-        });
+        text = await callPollinations(messages, system, max);
+      } catch(e) {
+        console.error(`[Pollinations ❌] ${e.message}`);
+        return res.json({ text:null, ai:'client-fallback', sessionId:session.id, remaining:buildRemaining(session) });
       }
     }
 
-    return res.json({
-      text:      responseText,
-      ai:        aiUsed,
-      sessionId: session.id,
-      remaining: buildRemaining(session)
-    });
+    return res.json({ text, ai, sessionId:session.id, remaining:buildRemaining(session) });
 
-  } catch (err) {
+  } catch(err) {
     console.error('[Server Error]', err.message);
-    res.status(500).json({ error: 'Server error', message: err.message });
+    res.status(500).json({ error:'Server error', message:err.message });
   }
 });
 
-/* ── Helper: build remaining quota object ── */
-function buildRemaining(session) {
+function buildRemaining(s) {
   return {
-    chat:   Math.max(0, QUOTAS.chat   - (session.usage.chat   || 0)),
-    lesson: Math.max(0, QUOTAS.lesson - (session.usage.lesson || 0)),
-    visual: Math.max(0, QUOTAS.visual - (session.usage.visual || 0)),
-    coding: Math.max(0, QUOTAS.coding - (session.usage.coding || 0)),
+    chat:   Math.max(0, QUOTAS.chat   - (s.usage.chat  ||0)),
+    lesson: Math.max(0, QUOTAS.lesson - (s.usage.lesson||0)),
+    visual: Math.max(0, QUOTAS.visual - (s.usage.visual||0)),
+    coding: Math.max(0, QUOTAS.coding - (s.usage.coding||0)),
   };
 }
 
-/* ════════════════════════════════════════════════════════════════
-   📊  GET /api/quota  — Check remaining quota for a session
-════════════════════════════════════════════════════════════════ */
 app.get('/api/quota', (req, res) => {
-  const sid = req.headers['x-session-id'] || '';
-  const session = getOrCreateSession(sid);
-  res.setHeader('x-session-id', session.id);
-  res.json({
-    sessionId: session.id,
-    remaining: buildRemaining(session),
-    limits:    QUOTAS
-  });
+  const s = getOrCreateSession(req.headers['x-session-id']||'');
+  res.setHeader('x-session-id', s.id);
+  res.json({ sessionId:s.id, remaining:buildRemaining(s), limits:QUOTAS });
 });
 
-/* ── Health check (Render uses this to detect app is up) ── */
-app.get('/health', (_, res) => res.json({ status: 'ok', sessions: sessions.size }));
+app.get('/api/status', (_,res) => res.json({
+  status:'ok', sessions:sessions.size,
+  gemini: { '2.0-flash': RL.usage('gemini-2.0-flash')+'/12rpm', '1.5-flash': RL.usage('gemini-1.5-flash')+'/12rpm' }
+}));
 
-/* ── Serve the frontend HTML from root folder ── */
+app.get('/health', (_,res) => res.json({ status:'ok', sessions:sessions.size }));
+
 app.use(express.static(__dirname));
 app.get('*', (req, res) => {
-  const htmlPath = path.join(__dirname, 'MicroMind_v22.html');
-  const fs = require('fs');
-  if (fs.existsSync(htmlPath)) {
-    res.sendFile(htmlPath);
-  } else {
-    res.send(`
-      <html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#F5F3FF">
-        <h1 style="color:#7C3AED">🧠 MicroMind Server is Running! ✅</h1>
-        <p style="color:#666;font-size:18px">But <b>MicroMind_v22.html</b> is missing from your repo.</p>
-        <p style="color:#666">Please upload <b>MicroMind_v22.html</b> to your GitHub repo root folder.</p>
-        <p style="margin-top:30px;color:#059669;font-size:16px">✅ Gemini AI Studio: ${process.env.GEMINI_API_KEY ? 'Key Loaded' : 'Key Missing'}</p>
-        <p style="color:#059669">✅ API endpoints /api/ai and /api/quota are working!</p>
-      </body></html>
-    `);
-  }
+  const p = path.join(__dirname, 'MicroMind_v22.html');
+  if (fs.existsSync(p)) res.sendFile(p);
+  else res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#F5F3FF">
+    <h1 style="color:#7C3AED">🧠 MicroMind Server v2 ✅</h1>
+    <p>Upload MicroMind_v22.html to repo root.</p>
+    <p style="color:#059669">Gemini: ${process.env.GEMINI_API_KEY?'✅ Key loaded':'❌ Key missing!'}</p>
+  </body></html>`);
 });
 
-/* ── START ── */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 MicroMind server running on port ${PORT}`);
-  console.log(`📡 Gemini AI Studio: ${process.env.GEMINI_API_KEY ? '✅ Key loaded' : '❌ GEMINI_API_KEY not set!'}`);
-  console.log(`📊 Quotas: Chat=${QUOTAS.chat} Lesson=${QUOTAS.lesson} Visual=${QUOTAS.visual} Coding=${QUOTAS.coding}`);
-  console.log(`🌐 Open: http://localhost:${PORT}\n`);
+  console.log(`\n🚀 MicroMind Server v2 — port ${PORT}`);
+  console.log(`📡 Gemini: ${process.env.GEMINI_API_KEY ? '✅ Key loaded' : '❌ KEY MISSING!'}`);
+  console.log(`⚡ Dual Gemini: gemini-2.0-flash + gemini-1.5-flash = 30 RPM free`);
+  console.log(`🌟 Pollinations: 6 models racing in parallel\n`);
 });
