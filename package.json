@@ -1,0 +1,19 @@
+{
+  "name": "macromind",
+  "version": "1.0.0",
+  "description": "MicroMind AI Tutor — Gemini AI Studio + Pollinations fallback",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  },
+  "keywords": ["education", "ai", "tutor"],
+  "license": "MIT"
+}
