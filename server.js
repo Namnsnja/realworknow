@@ -280,7 +280,7 @@ app.get('/health', (_, res) => res.json({ status: 'ok', sessions: sessions.size 
 /* ── Serve the frontend HTML from /public folder ── */
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  res.sendFile(path.join(__dirname, 'public', 'MicroMind_v22.html'));
 });
 
 /* ── START ── */
