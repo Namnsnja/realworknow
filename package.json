@@ -1,5 +1,5 @@
 {
-  "name": "macromind",
+  "name": "micromind",
   "version": "1.0.0",
   "description": "MicroMind AI Tutor — Gemini AI Studio + Pollinations fallback",
   "main": "server.js",
