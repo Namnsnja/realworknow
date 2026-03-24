@@ -1,261 +1,312 @@
-/* ════════════════════════════════════════════════════════════════
-   🧠 MicroMind Server v2 — FIXED: Rate Limit + Parallel AI
-   ─────────────────────────────────────────────────────────────────
-   BUG FIXES:
-   ✅ Fix 1: Dual Gemini models (2.0-flash + 1.5-flash) = 2x quota
-   ✅ Fix 2: Rate limiter — max 12 calls/min per Gemini model
-   ✅ Fix 3: Pollinations runs PARALLEL (Promise.any) not sequential
-   ✅ Fix 4: If Gemini 429 → auto-switch to other Gemini model
-   ✅ Fix 5: Server ALWAYS returns something — never leaves user hanging
-   ════════════════════════════════════════════════════════════════ */
+/**
+ * ╔══════════════════════════════════════════════════════════════════╗
+ * ║   MicroMind v25 — AI SERVER  (Render.com · Node 18+)           ║
+ * ║   ALL Google AI Studio FREE-QUOTA models racing in parallel     ║
+ * ║   🍌 Nano-Banana Coding Teacher · 📚 Teaches Everything        ║
+ * ╚══════════════════════════════════════════════════════════════════╝
+ *
+ * ENV VARS (set in Render dashboard):
+ *   GEMINI_API_KEY  — your Google AI Studio key (free, no billing needed)
+ *   PORT            — auto-set by Render (default 3000)
+ *
+ * DEPLOY:
+ *   1. Push this folder to GitHub
+ *   2. Create Render Web Service → Build: npm install · Start: node server.js
+ *   3. Add env var GEMINI_API_KEY
+ *   4. Done — copy the .onrender.com URL into the HTML _SERVER constant
+ */
 
-const express = require('express');
-const cors    = require('cors');
-const path    = require('path');
-const crypto  = require('crypto');
-const fs      = require('fs');
+import express   from 'express';
+import cors      from 'cors';
+import crypto    from 'crypto';
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '3mb' }));
+/* ── CONFIG ─────────────────────────────────────────────────────── */
+const PORT    = process.env.PORT || 3000;
+const API_KEY = process.env.GEMINI_API_KEY || '';
 
-/* ── QUOTA CONFIG ── */
-const QUOTAS = { chat: 15, lesson: 8, visual: 15, coding: 20 };
-
-/* ── SESSION STORE ── */
-const sessions = new Map();
-function getOrCreateSession(sid) {
-  if (!sid || !sessions.has(sid)) {
-    const newId = crypto.randomUUID();
-    sessions.set(newId, { id: newId, createdAt: Date.now(), usage: { chat:0, lesson:0, visual:0, coding:0 } });
-    return sessions.get(newId);
-  }
-  return sessions.get(sid);
+if (!API_KEY) {
+  console.warn('⚠️  GEMINI_API_KEY not set — AI calls will fail. Add it in Render env vars!');
 }
-setInterval(() => {
-  const cutoff = Date.now() - 86400000;
-  for (const [k, s] of sessions) if (s.createdAt < cutoff) sessions.delete(k);
-}, 1800000);
 
-/* ════════════════════════════════════════════════════════════════
-   ⏱️  RATE LIMITER — prevents Gemini 429 errors
-   Free Gemini = 15 RPM per model. We cap at 12 to be safe.
-════════════════════════════════════════════════════════════════ */
-const RL = {
-  calls: {},
-  MAX: 12,
-  canCall(m) {
-    const now = Date.now();
-    if (!this.calls[m]) this.calls[m] = [];
-    this.calls[m] = this.calls[m].filter(t => now - t < 60000);
-    return this.calls[m].length < this.MAX;
-  },
-  record(m) { if (!this.calls[m]) this.calls[m] = []; this.calls[m].push(Date.now()); },
-  usage(m)  { const now=Date.now(); return (this.calls[m]||[]).filter(t=>now-t<60000).length; }
-};
+/* ── ALL FREE-QUOTA GEMINI MODELS (AI Studio, no billing required) ─
+   Promise.any() races them all — fastest valid response wins!
+   Free limits (as of 2025-2026):
+     gemini-2.0-flash      → 1 500 req/day, 15 RPM
+     gemini-2.0-flash-lite → 1 500 req/day, 30 RPM  ← lightest, fastest
+     gemini-1.5-flash      → 1 500 req/day, 15 RPM
+     gemini-1.5-flash-8b   → 1 500 req/day, 15 RPM
+     gemini-2.5-pro        →    25 req/day,  2 RPM  (smartest!)
+     gemma-3-27b-it        → 1 500 req/day, 30 RPM
+     gemma-3-12b-it        → 1 500 req/day, 30 RPM
+     gemma-3-4b-it         → 1 500 req/day, 30 RPM
+     gemma-3-1b-it         → 1 500 req/day, 60 RPM  ← fastest of all
+   ─────────────────────────────────────────────────────────────── */
+const MODELS = [
+  { id: 'gemini-2.0-flash',       emoji: '🔮', name: 'Gemini 2.0 Flash'       },
+  { id: 'gemini-2.0-flash-lite',  emoji: '⚡', name: 'Gemini 2.0 Flash Lite'  },
+  { id: 'gemini-1.5-flash',       emoji: '🌊', name: 'Gemini 1.5 Flash'       },
+  { id: 'gemini-1.5-flash-8b',    emoji: '🐦', name: 'Gemini 1.5 Flash 8B'   },
+  { id: 'gemini-2.5-pro',         emoji: '💎', name: 'Gemini 2.5 Pro'         },
+  { id: 'gemma-3-27b-it',         emoji: '🦁', name: 'Gemma 3 27B'            },
+  { id: 'gemma-3-12b-it',         emoji: '🐯', name: 'Gemma 3 12B'            },
+  { id: 'gemma-3-4b-it',          emoji: '🐼', name: 'Gemma 3 4B'             },
+  { id: 'gemma-3-1b-it',          emoji: '🐣', name: 'Gemma 3 1B'             },
+];
 
-/* ════════════════════════════════════════════════════════════════
-   🤖  GEMINI — 2 models = 30 RPM total free quota
-   gemini-2.0-flash: 15 RPM (separate pool)
-   gemini-1.5-flash: 15 RPM (separate pool)
-   If one 429s → instantly switch to other!
-════════════════════════════════════════════════════════════════ */
-async function callGeminiModel(model, messages, system, maxTokens) {
-  const KEY = process.env.GEMINI_API_KEY;
-  if (!KEY) throw new Error('NO_KEY');
-  if (!RL.canCall(model)) throw new Error(`RATE_LIMIT:${model}:${RL.usage(model)}/min`);
+/* ── MASTER SYSTEM PROMPT ────────────────────────────────────────
+   🍌 NANO BANANA MODE — teach everyone from absolute zero!
+   ─────────────────────────────────────────────────────────────── */
+const MASTER_SYSTEM = `You are MicroMind AI — the most fun, patient, and brilliant AI teacher ever built!
 
-  const contents = [];
-  for (const m of messages) {
-    const role = m.role === 'assistant' ? 'model' : 'user';
-    const text = String(m.content || '').trim();
-    if (!text) continue;
-    if (contents.length && contents[contents.length-1].role === role)
-      contents[contents.length-1].parts[0].text += '\n' + text;
-    else contents.push({ role, parts: [{ text }] });
+🍌 NANO BANANA TEACHING MODE (for absolute beginners):
+Explain EVERYTHING like the student has NEVER seen it before.
+Use the "Banana Rule": if a 6-year-old holding a banana can't understand your answer → simplify it MORE.
+Nano = tiny bites of knowledge. Never overwhelm. One idea at a time.
+
+🎯 YOUR TEACHING SUPERPOWERS:
+• Coding (Python, JavaScript, HTML/CSS, Java, C++, Scratch) — from nano/zero to advanced
+• All CBSE/NCERT school subjects: Maths, Science, English, Hindi, SST, Computer Science
+• Physics, Chemistry, Accountancy, Business Studies (Class 11-12)
+• Life skills, exam strategy, interview prep, problem solving
+• Anything a curious Indian student age 6-22 might ask
+
+🧠 HOW YOU TEACH:
+1. START with a WOW hook — surprise them! A cool fact, a funny analogy
+2. EXPLAIN with Indian examples: chai, cricket, Bollywood, IRCTC, Swiggy, IPL, auto-rickshaw
+3. SHOW working code always (for coding questions) — copy-paste ready
+4. BREAK it into nano steps — never skip a step
+5. CELEBRATE progress: "You just wrote your first loop! 🎉 That's HUGE!"
+6. END with a tiny challenge or encouraging question
+
+🍌 CODING NANO RULES:
+• Variable = "lunchbox that stores one thing"
+• Function = "magic spell you name and reuse"
+• Loop = "same thing again and again — like brushing teeth daily"
+• If-else = "traffic signal — red=stop/green=go"
+• Array = "row of seats in a classroom"
+• Object = "Aadhaar card — name, age, address all together"
+Always show BEFORE (concept) and AFTER (working code + output)
+
+🇮🇳 HINGLISH IS WELCOME:
+Mix Hindi and English naturally when it helps understanding.
+"Suno yaar, variable ek dabba hai..." is GREAT! Make it personal and warm.
+
+📝 RESPONSE FORMAT:
+• Short paragraphs — no walls of text
+• Code in proper code blocks with comments in English/Hinglish
+• Emojis to mark sections but don't overdo it
+• For board exam answers: mark each point with [1M] [2M] [3M]
+• Max ~400 words unless deep explanation needed
+
+🚫 NEVER:
+• Say "I can't explain that" — always find a simpler way
+• Give generic answers — be SPECIFIC to the question
+• Write code with errors — test mentally before writing
+• Be boring — learning should be FUN!`;
+
+/* ── SESSION STORE (in-memory, resets on restart) ─────────────── */
+const sessions = new Map(); // sessionId → { calls: 0, reset: timestamp }
+const HOURLY_LIMIT = 120;   // per session per hour
+
+function getSession(id) {
+  if (!id || !sessions.has(id)) {
+    const newId = id || crypto.randomUUID();
+    sessions.set(newId, { calls: 0, reset: Date.now() + 3_600_000 });
+    return { id: newId, ...sessions.get(newId) };
   }
-  if (!contents.length || contents[0].role !== 'user')
-    contents.unshift({ role:'user', parts:[{ text:'Hello' }] });
+  const s = sessions.get(id);
+  if (Date.now() > s.reset) { s.calls = 0; s.reset = Date.now() + 3_600_000; }
+  return { id, ...s };
+}
+
+function tickSession(id) {
+  const s = sessions.get(id);
+  if (s) s.calls++;
+}
+
+/* ── GEMINI API CALL (single model) ──────────────────────────── */
+async function callGemini(modelId, messages, systemPrompt, maxTokens, timeoutMs = 9000) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${API_KEY}`;
+
+  // Convert OpenAI-style messages → Gemini format
+  // Gemini uses 'model' not 'assistant', and parts[] not content
+  const contents = messages
+    .filter(m => m.content && m.content.trim().length > 0)
+    .map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content.trim() }],
+    }));
+
+  // Gemini needs alternating user/model turns
+  // Merge consecutive same-role messages
+  const merged = [];
+  for (const turn of contents) {
+    if (merged.length && merged[merged.length - 1].role === turn.role) {
+      merged[merged.length - 1].parts[0].text += '\n' + turn.parts[0].text;
+    } else {
+      merged.push({ ...turn, parts: [{ text: turn.parts[0].text }] });
+    }
+  }
+  // Must start with user
+  if (!merged.length || merged[0].role !== 'user') {
+    merged.unshift({ role: 'user', parts: [{ text: 'Hello' }] });
+  }
 
   const body = {
-    contents,
-    generationConfig: { maxOutputTokens: Math.min(maxTokens, 900), temperature: 0.8, topP: 0.95 }
+    system_instruction: { parts: [{ text: systemPrompt || MASTER_SYSTEM }] },
+    contents: merged,
+    generationConfig: {
+      maxOutputTokens: Math.min(maxTokens || 900, 2048),
+      temperature: 0.75,
+      topP: 0.9,
+    },
   };
-  if (system && system.trim())
-    body.systemInstruction = { parts: [{ text: system.trim().slice(0, 800) }] };
 
-  RL.record(model);
-
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${KEY}`,
-    { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body), signal:AbortSignal.timeout(18000) }
-  );
-
-  if (!res.ok) {
-    const err = await res.text().catch(()=>'');
-    throw new Error(`Gemini_${res.status}: ${err.slice(0,100)}`);
-  }
-  const data = await res.json();
-  if (data.candidates?.[0]?.finishReason === 'SAFETY') throw new Error('SAFETY');
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text || text.length < 4) throw new Error('EMPTY');
-  return text.trim();
-}
-
-async function callGemini(messages, system, maxTokens) {
-  for (const model of ['gemini-2.0-flash', 'gemini-1.5-flash']) {
-    try {
-      const text = await callGeminiModel(model, messages, system, maxTokens);
-      console.log(`[Gemini ✅] ${model} rpm=${RL.usage(model)}`);
-      return text;
-    } catch (e) {
-      const msg = String(e.message);
-      if (msg.includes('429') || msg.includes('RATE_LIMIT')) {
-        console.warn(`[Gemini ⚠️] ${model} rate limited → trying next model`);
-      } else {
-        console.warn(`[Gemini ⚠️] ${model}: ${msg.slice(0,60)}`);
-      }
-    }
-  }
-  throw new Error('All Gemini models failed');
-}
-
-/* ════════════════════════════════════════════════════════════════
-   🌟  POLLINATIONS — ALL models race in PARALLEL
-   Promise.any = first valid response wins, no sequential waiting!
-════════════════════════════════════════════════════════════════ */
-async function pollModel(model, messages, system, maxTokens, ms=13000) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
-    const res = await fetch('https://text.pollinations.ai/openai', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        model,
-        messages: system ? [{role:'system',content:system.slice(0,500)}, ...messages] : messages,
-        max_tokens: Math.min(maxTokens, 700),
-        seed: Math.floor(Math.random()*9999)
-      }),
-      signal: controller.signal
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
     });
+
+    if (res.status === 429) throw new Error(`rate-limit-${modelId}`);
+    if (res.status === 503) throw new Error(`overloaded-${modelId}`);
+    if (!res.ok) throw new Error(`http-${res.status}-${modelId}`);
+
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text || text.trim().length < 5) throw new Error(`empty-${modelId}`);
+
+    return { text: text.trim(), model: modelId };
+  } finally {
     clearTimeout(timer);
-    if (!res.ok) throw new Error(`${model}-${res.status}`);
-    const d = await res.json();
-    const t = d.choices?.[0]?.message?.content;
-    if (!t || t.length < 5) throw new Error('empty');
-    return t.trim();
-  } catch(e) { clearTimeout(timer); throw e; }
-}
-
-async function callPollinations(messages, system, maxTokens) {
-  // Round 1: 4 models in parallel
-  try {
-    const result = await Promise.any([
-      pollModel('openai-large', messages, system, maxTokens),
-      pollModel('mistral',      messages, system, maxTokens),
-      pollModel('openai',       messages, system, maxTokens),
-      pollModel('llama',        messages, system, maxTokens),
-    ]);
-    console.log(`[Pollinations ✅] parallel`);
-    return result;
-  } catch(e) {}
-
-  // Round 2: backup models
-  try {
-    const result = await Promise.any([
-      pollModel('qwen-coder', messages, system, maxTokens),
-      pollModel('phi',        messages, system, maxTokens),
-    ]);
-    return result;
-  } catch(e) {
-    throw new Error('All Pollinations failed');
   }
 }
 
-/* ════════════════════════════════════════════════════════════════
-   📡  POST /api/ai
-════════════════════════════════════════════════════════════════ */
-app.post('/api/ai', async (req, res) => {
+/* ── RACE ALL MODELS ─────────────────────────────────────────── */
+async function callAllGemini(messages, systemPrompt, maxTokens) {
+  // All 9 models start simultaneously — fastest valid response wins!
   try {
-    const { messages=[], system='', max=1200, type='chat' } = req.body;
-    if (!messages.length) return res.status(400).json({ error:'No messages' });
-
-    const session = getOrCreateSession(req.headers['x-session-id']||'');
-    res.setHeader('x-session-id', session.id);
-
-    const key   = QUOTAS[type]!==undefined ? type : 'chat';
-    const limit = QUOTAS[key];
-    const used  = session.usage[key]||0;
-
-    let text = null, ai = 'pollinations';
-
-    if (used < limit) {
+    const result = await Promise.any(
+      MODELS.map(m => callGemini(m.id, messages, systemPrompt, maxTokens))
+    );
+    return result;
+  } catch (aggErr) {
+    // All failed (AggregateError) — try sequentially as last resort
+    for (const m of MODELS) {
       try {
-        text = await callGemini(messages, system, max);
-        session.usage[key] = used + 1;
-        ai = 'gemini';
-      } catch(e) {
-        console.warn(`[Gemini ❌] ${String(e.message).slice(0,80)} → Pollinations`);
-      }
-    } else {
-      console.log(`[Quota 🔒] ${type} ${limit} reached → Pollinations`);
+        return await callGemini(m.id, messages, systemPrompt, maxTokens, 15000);
+      } catch (_) { /* continue */ }
     }
-
-    if (!text) {
-      try {
-        text = await callPollinations(messages, system, max);
-      } catch(e) {
-        console.error(`[Pollinations ❌] ${e.message}`);
-        return res.json({ text:null, ai:'client-fallback', sessionId:session.id, remaining:buildRemaining(session) });
-      }
-    }
-
-    return res.json({ text, ai, sessionId:session.id, remaining:buildRemaining(session) });
-
-  } catch(err) {
-    console.error('[Server Error]', err.message);
-    res.status(500).json({ error:'Server error', message:err.message });
+    throw new Error('all-models-failed');
   }
-});
-
-function buildRemaining(s) {
-  return {
-    chat:   Math.max(0, QUOTAS.chat   - (s.usage.chat  ||0)),
-    lesson: Math.max(0, QUOTAS.lesson - (s.usage.lesson||0)),
-    visual: Math.max(0, QUOTAS.visual - (s.usage.visual||0)),
-    coding: Math.max(0, QUOTAS.coding - (s.usage.coding||0)),
-  };
 }
 
-app.get('/api/quota', (req, res) => {
-  const s = getOrCreateSession(req.headers['x-session-id']||'');
-  res.setHeader('x-session-id', s.id);
-  res.json({ sessionId:s.id, remaining:buildRemaining(s), limits:QUOTAS });
-});
+/* ── EXPRESS SETUP ───────────────────────────────────────────── */
+const app = express();
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'] }));
+app.use(express.json({ limit: '4mb' }));
 
-app.get('/api/status', (_,res) => res.json({
-  status:'ok', sessions:sessions.size,
-  gemini: { '2.0-flash': RL.usage('gemini-2.0-flash')+'/12rpm', '1.5-flash': RL.usage('gemini-1.5-flash')+'/12rpm' }
+/* ── HEALTH CHECK ────────────────────────────────────────────── */
+app.get('/', (_, res) => res.json({
+  status: 'ok',
+  app: 'MicroMind v25 AI Server',
+  models: MODELS.length,
+  mode: '🍌 Nano Banana Teaching Mode',
+  hasKey: !!API_KEY,
 }));
 
-app.get('/health', (_,res) => res.json({ status:'ok', sessions:sessions.size }));
-
-app.use(express.static(__dirname));
-app.get('*', (req, res) => {
-  const p = path.join(__dirname, 'MicroMind_v22.html');
-  if (fs.existsSync(p)) res.sendFile(p);
-  else res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#F5F3FF">
-    <h1 style="color:#7C3AED">🧠 MicroMind Server v2 ✅</h1>
-    <p>Upload MicroMind_v22.html to repo root.</p>
-    <p style="color:#059669">Gemini: ${process.env.GEMINI_API_KEY?'✅ Key loaded':'❌ Key missing!'}</p>
-  </body></html>`);
+/* ── QUOTA STATUS ────────────────────────────────────────────── */
+app.get('/api/quota', (req, res) => {
+  const sid = req.headers['x-session-id'] || '';
+  const session = getSession(sid);
+  res.json({
+    sessionId: session.id,
+    calls: session.calls,
+    limit: HOURLY_LIMIT,
+    remaining: Math.max(0, HOURLY_LIMIT - session.calls),
+    resetsAt: new Date(session.reset).toISOString(),
+    models: MODELS.map(m => ({ id: m.id, emoji: m.emoji, name: m.name })),
+  });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 MicroMind Server v2 — port ${PORT}`);
-  console.log(`📡 Gemini: ${process.env.GEMINI_API_KEY ? '✅ Key loaded' : '❌ KEY MISSING!'}`);
-  console.log(`⚡ Dual Gemini: gemini-2.0-flash + gemini-1.5-flash = 30 RPM free`);
-  console.log(`🌟 Pollinations: 6 models racing in parallel\n`);
+/* ── MAIN AI ENDPOINT ────────────────────────────────────────── */
+app.post('/api/ai', async (req, res) => {
+  const sid = req.headers['x-session-id'] || '';
+  const session = getSession(sid);
+
+  if (session.calls >= HOURLY_LIMIT) {
+    return res.status(429).json({
+      error: 'hourly_limit',
+      message: 'Free quota reached for this session. Resets in 1 hour!',
+      resetsAt: new Date(session.reset).toISOString(),
+      sessionId: session.id,
+    });
+  }
+
+  if (!API_KEY) {
+    return res.status(503).json({
+      error: 'no_api_key',
+      message: 'GEMINI_API_KEY not configured on server. Add it in Render env vars!',
+    });
+  }
+
+  const { messages, system, max, type } = req.body;
+
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: 'messages array required' });
+  }
+
+  // Build system prompt — merge app-specific context with master teaching prompt
+  const systemPrompt = system
+    ? `${MASTER_SYSTEM}\n\n---\n🎯 SPECIFIC TASK CONTEXT:\n${system}`
+    : MASTER_SYSTEM;
+
+  try {
+    const { text, model } = await callAllGemini(messages, systemPrompt, max || 900);
+    tickSession(session.id);
+
+    return res.json({
+      text,
+      model,
+      sessionId: session.id,
+      callsThisHour: session.calls + 1,
+    });
+  } catch (err) {
+    console.error('[MicroMind] AI error:', err.message);
+    return res.status(502).json({
+      error: 'ai_failed',
+      message: 'All Gemini models failed. Check your API key and quota.',
+      detail: err.message,
+      sessionId: session.id,
+    });
+  }
+});
+
+/* ── MODELS LIST ─────────────────────────────────────────────── */
+app.get('/api/models', (_, res) => {
+  res.json({
+    models: MODELS,
+    strategy: 'Promise.any() — all race, fastest wins',
+    freeQuota: 'All models use Google AI Studio free tier (no billing)',
+    teachingMode: '🍌 Nano Banana — explains from absolute zero',
+  });
+});
+
+/* ── START ───────────────────────────────────────────────────── */
+app.listen(PORT, () => {
+  console.log(`
+╔═══════════════════════════════════════════════════════╗
+║  🧠 MicroMind v25 AI Server — LIVE on port ${PORT}       ║
+║  🍌 Nano Banana Teaching Mode ACTIVE                  ║
+║  🔮 ${MODELS.length} Gemini models ready to race                   ║
+║  🔑 API Key: ${API_KEY ? '✅ Set' : '❌ MISSING — set GEMINI_API_KEY!'}              ║
+╚═══════════════════════════════════════════════════════╝
+Models racing:
+${MODELS.map(m => `  ${m.emoji} ${m.name} (${m.id})`).join('\n')}
+  `);
 });
