@@ -467,12 +467,79 @@ function buildFallbackWhiteboard(topic, cls, subject) {
 }
 
 /* ──────────────────────────────────────────────────────────────────
+   GET /  — Beautiful status homepage
+────────────────────────────────────────────────────────────────── */
+app.get('/', (_req, res) => {
+  const uptime = Math.round(process.uptime());
+  const mins   = Math.floor(uptime / 60);
+  const secs   = uptime % 60;
+  const keyOk  = !!GEMINI_KEY;
+
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>MicroMind v25 — AI Tutor Server</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:'Segoe UI',sans-serif;background:#0F0A1E;color:#E9D5FF;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
+  .card{background:linear-gradient(135deg,#1E1B4B,#2D1B69);border-radius:24px;padding:36px 32px;max-width:480px;width:100%;border:2px solid #4C1D95;box-shadow:0 20px 60px rgba(79,29,150,.5);}
+  .logo{font-size:52px;text-align:center;margin-bottom:12px;}
+  h1{font-size:26px;font-weight:800;text-align:center;background:linear-gradient(135deg,#A78BFA,#E9D5FF);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px;}
+  .sub{text-align:center;color:#7C3AED;font-size:13px;font-weight:600;margin-bottom:28px;}
+  .badge{display:inline-flex;align-items:center;gap:6px;background:rgba(5,150,105,.15);border:1.5px solid #059669;border-radius:20px;padding:6px 14px;font-size:13px;font-weight:700;color:#6EE7B7;margin-bottom:20px;width:100%;justify-content:center;}
+  .section{background:rgba(0,0,0,.25);border-radius:16px;padding:16px 18px;margin-bottom:14px;border:1px solid rgba(124,58,237,.25);}
+  .section-title{font-size:10px;font-weight:800;color:#6B7280;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px;}
+  .row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.05);}
+  .row:last-child{border-bottom:none;}
+  .row-label{font-size:13px;color:#9CA3AF;font-weight:500;}
+  .row-val{font-size:13px;font-weight:700;color:#E9D5FF;}
+  .ok{color:#6EE7B7;} .warn{color:#FCD34D;} .err{color:#FCA5A5;}
+  .endpoint{background:rgba(0,0,0,.3);border-radius:10px;padding:8px 12px;font-family:monospace;font-size:12px;color:#A78BFA;margin-bottom:6px;border-left:3px solid #4C1D95;}
+  .method{color:#FCD34D;margin-right:6px;font-weight:800;}
+  .pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:#10B981;box-shadow:0 0 0 0 rgba(16,185,129,.5);animation:pulse 1.5s infinite;}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(16,185,129,.5);}70%{box-shadow:0 0 0 8px rgba(16,185,129,0);}100%{box-shadow:0 0 0 0 rgba(16,185,129,0);}}
+  .footer{text-align:center;font-size:11px;color:#4B5563;margin-top:18px;}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">&#x1F9E0;</div>
+  <h1>MicroMind v25</h1>
+  <div class="sub">AI Tutor Server &middot; 9 Gemini Models Racing &middot; 100% Free</div>
+  <div class="badge"><span class="pulse"></span> &#x2705; Server is Live &amp; Running!</div>
+  <div class="section">
+    <div class="section-title">&#x26A1; Server Status</div>
+    <div class="row"><span class="row-label">Status</span><span class="row-val ok">&#x1F7E2; Online</span></div>
+    <div class="row"><span class="row-label">Uptime</span><span class="row-val">${mins}m ${secs}s</span></div>
+    <div class="row"><span class="row-label">Gemini API Key</span><span class="row-val ${keyOk ? 'ok' : 'err'}">${keyOk ? '&#x2705; Set & Ready' : '&#x274C; MISSING!'}</span></div>
+    <div class="row"><span class="row-label">Models Racing</span><span class="row-val ok">${GEMINI_MODELS.length} Gemini Models &#x1F52E;</span></div>
+    <div class="row"><span class="row-label">Total Requests</span><span class="row-val">${totalRequests} served</span></div>
+  </div>
+  <div class="section">
+    <div class="section-title">&#x1F50C; API Endpoints</div>
+    <div class="endpoint"><span class="method">GET</span>/health</div>
+    <div class="endpoint"><span class="method">GET</span>/api/quota</div>
+    <div class="endpoint"><span class="method">POST</span>/api/ai &mdash; { messages, system, max, type }</div>
+    <div class="endpoint"><span class="method">POST</span>/api/whiteboard &mdash; { topic, cls, subject }</div>
+  </div>
+  ${!keyOk ? `<div class="section" style="border-color:#EF4444;"><div class="section-title" style="color:#EF4444;">&#x26A0; Action Required</div><div style="font-size:13px;color:#FCA5A5;line-height:1.7;">Add your <strong>GEMINI_API_KEY</strong> in Render Dashboard &rarr; Your Service &rarr; Environment</div></div>` : ''}
+  <div class="footer">MicroMind v25 &middot; Made with &#x1F49C; for Indian Students &middot; 100% Free</div>
+</div>
+</body>
+</html>`);
+});
+
+/* ──────────────────────────────────────────────────────────────────
    404 CATCH-ALL
 ────────────────────────────────────────────────────────────────── */
-app.use((_req, res) => {
+app.use((req, res) => {
   res.status(404).json({
-    error: 'Not found',
-    endpoints: [
+    error: `Route '${req.method} ${req.path}' not found`,
+    availableEndpoints: [
+      'GET  /',
       'GET  /health',
       'GET  /api/quota',
       'POST /api/ai          — { messages, system, max, type }',
