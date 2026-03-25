@@ -3,6 +3,7 @@
   "version": "25.0.0",
   "description": "MicroMind AI Tutor — Render backend: 9 Gemini models race + AI Whiteboard",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
