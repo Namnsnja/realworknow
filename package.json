@@ -1,11 +1,9 @@
 {
   "name": "micromind-ai-server",
-  "version": "25.0.0",
-  "description": "MicroMind v25 — 9 Gemini models racing for the fastest AI tutor answer! 🏁",
+  "version": "25.1.0",
+  "description": "MicroMind v25 backend — 9 Gemini models racing for fastest AI answer",
   "main": "server.js",
-  "engines": {
-    "node": ">=18.0.0"
-  },
+  "engines": { "node": ">=18.0.0" },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
@@ -15,6 +13,5 @@
     "express": "^4.19.2",
     "uuid": "^9.0.1"
   },
-  "keywords": ["gemini", "ai", "education", "india", "tutor"],
   "license": "MIT"
 }
