@@ -1,148 +1,140 @@
-/* ═══════════════════════════════════════════════════════════════════
-   🔮 MicroMind v27 — Render Server
-   Races all 9 FREE Gemini models simultaneously — fastest reply wins!
+/*
+ ╔══════════════════════════════════════════════════════════════╗
+ ║   MicroMind AI Server v2 — Fixed for Render.com             ║
+ ║   Races ALL 9 FREE Gemini models — fastest one wins!        ║
+ ╚══════════════════════════════════════════════════════════════╝
+*/
 
-   SETUP:
-   1. npm install
-   2. Set env var:  GEMINI_API_KEY=AIza...   (free from aistudio.google.com)
-   3. node server.js   (or deploy to Render free tier)
-   ════════════════════════════════════════════════════════════════ */
+const express = require('express');
+const cors    = require('cors');
 
-const express  = require('express');
-const cors     = require('cors');
+const app  = express();
+const PORT = process.env.PORT || 10000;
+const HOST = '0.0.0.0';   // CRITICAL: must be 0.0.0.0 for Render port detection
+const GEMINI_KEY = process.env.GEMINI_API_KEY || '';
 
-const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '2mb' }));
 
-/* ── 9 FREE-QUOTA GEMINI MODELS ── */
-const GEMINI_MODELS = [
+/* Keep-alive ping */
+app.get('/ping', (req, res) => res.send('pong'));
+
+/* All 9 FREE Gemini models */
+const MODELS = [
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite',
   'gemini-1.5-flash',
   'gemini-1.5-flash-8b',
-  'gemini-2.5-pro-preview-05-06',
+  'gemini-2.5-pro-exp-03-25',
   'gemma-3-27b-it',
   'gemma-3-12b-it',
   'gemma-3-4b-it',
   'gemma-3-1b-it',
 ];
 
-const KEY = process.env.GEMINI_API_KEY;
-if (!KEY) { console.error('❌  GEMINI_API_KEY env var not set!'); }
+async function callGemini(modelId, messages, system, maxTokens) {
+  if (!GEMINI_KEY) throw new Error('GEMINI_API_KEY not set');
 
-/* ── Call one Gemini model ── */
-async function callGemini(model, messages, system, maxTokens) {
-  const timeout = model.includes('2.5-pro') ? 25000 : 15000; // 2.5 Pro is slower
+  const contents = messages.map(m => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: String(m.content || '').trim() }],
+  }));
+
+  const body = {
+    contents,
+    generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 },
+  };
+  if (system) body.systemInstruction = { parts: [{ text: system }] };
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
+  const timer = setTimeout(() => controller.abort(), 16000);
 
   try {
-    /* Convert messages to Gemini format */
-    const contents = messages.map(m => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: String(m.content || '').trim() }]
-    })).filter(m => m.parts[0].text);
-
-    /* Ensure first message is user */
-    if (!contents.length || contents[0].role !== 'user') {
-      contents.unshift({ role: 'user', parts: [{ text: 'Hello' }] });
-    }
-
-    const body = {
-      contents,
-      generationConfig: {
-        maxOutputTokens: Math.min(maxTokens || 1000, 2048),
-        temperature: 0.7,
-      }
-    };
-
-    if (system) {
-      body.system_instruction = { parts: [{ text: system }] };
-    }
-
     const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${GEMINI_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal: controller.signal
+        signal: controller.signal,
       }
     );
-
     clearTimeout(timer);
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(`${model}: ${res.status} ${err?.error?.message || ''}`);
+      throw new Error(`${modelId} HTTP ${res.status}: ${err?.error?.message || 'error'}`);
     }
 
     const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text || text.trim().length < 4) throw new Error(`${modelId}: empty response`);
+    return { text: text.trim(), model: modelId };
 
-    if (data.error) throw new Error(`${model}: ${data.error.message}`);
-
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text || text.trim().length < 5) throw new Error(`${model}: empty response`);
-
-    return { text: text.trim(), model };
-  } catch (err) {
+  } catch (e) {
     clearTimeout(timer);
-    throw err;
+    throw e;
   }
 }
 
-/* ── /api/ai — race all 9 models ── */
-app.post('/api/ai', async (req, res) => {
-  const { messages, system, max, type } = req.body;
+function normalizeMessages(messages) {
+  let out = messages
+    .map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content || '').trim() }))
+    .filter(m => m.content.length > 0);
 
-  if (!KEY) {
-    return res.status(503).json({ error: 'GEMINI_API_KEY not configured on server.' });
+  if (!out.length || out[0].role !== 'user') out.unshift({ role: 'user', content: 'Hello' });
+
+  const merged = [];
+  for (const m of out) {
+    if (merged.length && merged[merged.length - 1].role === m.role)
+      merged[merged.length - 1].content += '\n' + m.content;
+    else merged.push({ ...m });
+  }
+  return merged;
+}
+
+/* POST /api/ai — Race 9 models, return fastest */
+app.post('/api/ai', async (req, res) => {
+  if (!GEMINI_KEY) {
+    return res.status(500).json({ error: 'GEMINI_API_KEY not set on server' });
   }
 
+  const { messages, system, max } = req.body || {};
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: 'messages array required' });
   }
 
-  try {
-    /* Race all 9 models — whoever answers first wins! */
-    const { text, model } = await Promise.any(
-      GEMINI_MODELS.map(m => callGemini(m, messages, system, max || 1200))
-    );
+  const norm   = normalizeMessages(messages);
+  const maxTok = Math.min(Number(max) || 1200, 1500);
 
-    console.log(`✅ Winner: ${model} (${text.length} chars)`);
-    res.json({ text, model, ok: true });
-  } catch (err) {
-    /* All 9 failed — that's rough */
-    console.error('❌ All Gemini models failed:', err?.errors?.map?.(e => e.message));
-    res.status(503).json({ error: 'All Gemini models failed. Check API key and quota.' });
+  console.log(`[AI] "${norm[norm.length-1]?.content?.slice(0,60)}..."`);
+
+  const racers = MODELS.map(id => callGemini(id, norm, system || null, maxTok));
+
+  try {
+    const winner = await Promise.any(racers);
+    console.log(`[AI] Winner: ${winner.model}`);
+    res.json({ text: winner.text, model: winner.model, ok: true });
+  } catch (aggErr) {
+    const details = aggErr?.errors?.map(e => e.message) || [aggErr.message];
+    console.error('[AI] All failed:', details);
+    res.status(503).json({ error: 'All Gemini models failed', details });
   }
 });
 
-/* ── /api/quota — health check ── */
-app.get('/api/quota', (req, res) => {
-  res.json({
-    status: 'ok',
-    models: GEMINI_MODELS.length,
-    hasKey: !!KEY,
-    message: KEY ? '🔮 Gemini server running!' : '⚠️ GEMINI_API_KEY not set'
-  });
-});
-
-/* ── Root ── */
+/* Root page */
 app.get('/', (req, res) => {
-  res.send(`
-    <h2>🔮 MicroMind AI Server v25</h2>
-    <p>Racing ${GEMINI_MODELS.length} Gemini models for fastest answers!</p>
-    <p>Status: ${KEY ? '✅ API Key configured' : '❌ GEMINI_API_KEY missing'}</p>
-    <p><a href="/api/quota">Check quota →</a></p>
-  `);
+  res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;max-width:500px;margin:60px auto;text-align:center">
+    <h1>🔮 MicroMind AI Server</h1>
+    <p style="color:green;font-size:18px"><b>✅ Running on port ${PORT}</b></p>
+    <p>Models: <b>${MODELS.length} Gemini models racing</b></p>
+    <p>Key: <b style="color:${GEMINI_KEY?'green':'red'}">${GEMINI_KEY?'✅ Set!':'❌ Add GEMINI_API_KEY env var!'}</b></p>
+  </body></html>`);
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`\n🚀 MicroMind server live on port ${PORT}`);
-  console.log(`🔮 ${GEMINI_MODELS.length} Gemini models ready to race`);
-  console.log(`🔑 API Key: ${KEY ? '✅ Set' : '❌ MISSING — set GEMINI_API_KEY env var!'}\n`);
+/* MUST bind to 0.0.0.0 — Render scans for open ports on this host */
+app.listen(PORT, HOST, () => {
+  console.log(`\n🚀 MicroMind server live on ${HOST}:${PORT}`);
+  console.log(`🎯 ${MODELS.length} Gemini models ready to race`);
+  console.log(`🔑 API Key: ${GEMINI_KEY ? '✅ Set' : '❌ NOT SET — add GEMINI_API_KEY in Render!'}\n`);
 });
