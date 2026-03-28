@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════════
-   🔮 MicroMind v25 — Render Server
+   🔮 MicroMind v27 — Render Server
    Races all 9 FREE Gemini models simultaneously — fastest reply wins!
 
    SETUP:
